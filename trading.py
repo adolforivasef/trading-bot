@@ -1,36 +1,16 @@
 import yfinance as yf
-import smtplib
-from email.mime.text import MIMEText
+import pandas as pd
 import requests
 import time
+from datetime import datetime, UTC
 
 # -------- CONFIG --------
+tickers = ["SPY","QQQ","NVDA","MSFT","AMZN","META"]
 
-tickers = ["QQQ","SPY","NVDA","MSFT","AMZN","META"]
-
-# 📩 EMAIL (opcional)
-EMAIL = "TU_EMAIL@gmail.com"
-PASSWORD = "TU_PASSWORD_APP"
-
-# 🤖 TELEGRAM
 TOKEN = "8655596407:AAENe10VPDPEe6wC_-KZdaqpvT8o7O2-blY"
 CHAT_ID = "881645405"
 
-# -------- EMAIL --------
-def send_email(msg):
-    try:
-        m = MIMEText(msg)
-        m["Subject"] = "ALERTA TRADING"
-        m["From"] = EMAIL
-        m["To"] = EMAIL
-
-        s = smtplib.SMTP("smtp.gmail.com", 587)
-        s.starttls()
-        s.login(EMAIL, PASSWORD)
-        s.send_message(m)
-        s.quit()
-    except:
-        pass
+last_message = None
 
 # -------- TELEGRAM --------
 def send_telegram(msg):
@@ -41,125 +21,107 @@ def send_telegram(msg):
     }
     requests.post(url, data=data)
 
-# -------- UTILS --------
-def get_data(t):
-    try:
-        df = yf.download(t, period="1y", interval="1d", progress=False)
-        if df is None or df.empty:
-            return None
-        return df
-    except:
+# -------- DATA --------
+def get_data(ticker):
+    df = yf.download(ticker, period="6mo", interval="1d", progress=False)
+    if df is None or df.empty:
         return None
+    return df
 
-def clean(series):
-    return [float(x) for x in series.squeeze().tolist() if str(x) != "nan"]
+# -------- SEÑALES --------
+def get_signal(df):
+    df["EMA50"] = df["Close"].ewm(span=50).mean()
+    df["EMA200"] = df["Close"].ewm(span=200).mean()
 
-def rsi(close, period=14):
-    gains, losses = [], []
-    for i in range(-period, 0):
-        diff = close[i] - close[i-1]
-        if diff > 0:
-            gains.append(diff)
-        else:
-            losses.append(abs(diff))
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
 
-    avg_gain = sum(gains)/period if gains else 0
-    avg_loss = sum(losses)/period if losses else 1
+    # COMPRA
+    if last["EMA50"] > last["EMA200"]:
+        if abs(last["Close"] - last["EMA50"]) / last["Close"] < 0.01:
+            if last["Close"] > prev["Close"]:
 
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+                entry = float(last["Close"])
+                stop = float(df["Low"].iloc[-5:].min())
+                tp = entry + (entry - stop) * 2
+
+                return f"🟢 COMPRA\nEntrada: {entry:.2f}\nStop: {stop:.2f}\nTP: {tp:.2f}"
+
+    # VENTA
+    if last["EMA50"] < last["EMA200"]:
+        if abs(last["Close"] - last["EMA50"]) / last["Close"] < 0.01:
+            if last["Close"] < prev["Close"]:
+
+                entry = float(last["Close"])
+                stop = float(df["High"].iloc[-5:].max())
+                tp = entry - (stop - entry) * 2
+
+                return f"🔴 VENTA\nEntrada: {entry:.2f}\nStop: {stop:.2f}\nTP: {tp:.2f}"
+
+    return None
 
 # -------- MERCADO --------
 def market_ok():
     df = get_data("SPY")
-    if df is None:
-        return False, "Error datos mercado"
+    if df is None or len(df) < 200:
+        return False
 
-    close = clean(df["Close"])
-    if len(close) < 200:
-        return False, "Datos insuficientes"
+    df["EMA50"] = df["Close"].ewm(span=50).mean()
+    df["EMA200"] = df["Close"].ewm(span=200).mean()
 
-    price = close[-1]
-    ma50 = sum(close[-50:]) / 50
-    ma200 = sum(close[-200:]) / 200
+    last = df.iloc[-1]
 
-    if price > ma50 and ma50 > ma200:
-        return True, "🟢 Mercado FUERTE"
-    elif price > ma200:
-        return False, "🟡 Mercado NEUTRO"
-    else:
-        return False, "🔴 Mercado DÉBIL"
-
-# -------- BASE --------
-def valid_base(high):
-    recent_high = max(high[-20:])
-    recent_low = min(high[-20:])
-    return (recent_high - recent_low) / recent_low < 0.08
-
-# -------- ANALISIS --------
-def analyze(t):
-    df = get_data(t)
-    if df is None:
-        return None
-
-    close = clean(df["Close"])
-    high = clean(df["High"])
-    low = clean(df["Low"])
-
-    if len(close) < 200:
-        return None
-
-    price = close[-1]
-    ma50 = sum(close[-50:]) / 50
-    ma200 = sum(close[-200:]) / 200
-    r = rsi(close)
-
-    breakout = max(high[-20:-1])
-    atr = sum(abs(h - l) for h, l in zip(high[-14:], low[-14:])) / 14
-
-    tendencia = price > ma50 and ma50 > ma200
-    base = valid_base(high)
-    ruptura = price > breakout
-    confirmacion = price < breakout * 1.05
-    rsi_ok = r < 70
-
-    if all([tendencia, base, ruptura, confirmacion, rsi_ok]):
-        return f"""
-{t} → COMPRAR
-Precio: {round(price,2)}
-Entrada: {round(breakout,2)}
-Stop: {round(breakout - 1.5*atr,2)}
-Objetivo: {round(breakout + 2*(1.5*atr),2)}
-"""
-
-    return None
+    return bool(last["EMA50"] > last["EMA200"])
 
 # -------- RUN --------
 def run():
-    
-    ok, estado = market_ok()
-    print("\n" + estado)
+    global last_message
 
-    if not ok:
-        print("NO OPERAR\n")
+    print("\nAnalizando mercado...\n")
+
+    # 🔹 FILTRO HORARIO (USA)
+    hour = datetime.now(UTC).hour
+    if hour < 12 or hour > 19:
+        print("⏰ Fuera de horario de mercado")
         return
 
-    print("Buscando oportunidades...\n")
+    # 🔹 MERCADO
+    if not market_ok():
+        msg = "❌ Mercado débil, no operar"
+        print(msg)
+        if msg != last_message:
+            send_telegram(msg)
+            last_message = msg
+        return
+
+    print("✅ Mercado favorable\n")
 
     mensajes = []
 
     for t in tickers:
-        res = analyze(t)
-        if res:
-            print(res)
-            mensajes.append(res)
+        df = get_data(t)
+        if df is None or len(df) < 200:
+            continue
 
+        signal = get_signal(df)
+
+        if signal:
+            texto = f"{t}\n{signal}"
+            print(texto)
+            mensajes.append(texto)
+
+    # 🔹 ENVÍO CONTROLADO
     if mensajes:
-        final = "🚨 SETUPS A+ 🚨\n\n" + "\n".join(mensajes)
-        send_telegram(final)
-        send_email(final)
+        final = "🚨 SEÑALES 🚨\n\n" + "\n\n".join(mensajes)
+        if final != last_message:
+            send_telegram(final)
+            last_message = final
     else:
-        print("Sin oportunidades claras\n")
+        msg = "⚠️ Sin oportunidades"
+        print(msg)
+        if msg != last_message:
+            send_telegram(msg)
+            last_message = msg
 
 # -------- LOOP --------
 while True:
