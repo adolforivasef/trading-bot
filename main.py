@@ -2,168 +2,169 @@ import yfinance as yf
 import pandas as pd
 import requests
 import time
-from datetime import datetime, timezone
+import os
 
-# -------- CONFIG --------
-tickers = ["SPY","QQQ","NVDA","MSFT","AMZN","META"]
+# ===== CONFIG =====
+TOKEN = os.getenv("8655596407:AAENe10VPDPEe6wC_-KZdaqpvT8o7O2-blY")
+CHAT_ID = os.getenv("881645405")
 
-TOKEN = "8655596407:AAENe10VPDPEe6wC_-KZdaqpvT8o7O2-blY"
-CHAT_ID = "881645405"
+RIESGO_EUR = 30
 
-RISK_EUR = 30
-last_message = None
+ACTIVOS = {
+    "SP500": "^GSPC",
+    "NASDAQ": "^IXIC",
+    "DAX": "^GDAXI",
+    "ORO": "GC=F",
+    "BRENT": "BZ=F",
+}
 
-# -------- TELEGRAM --------
-def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    data = {"chat_id": CHAT_ID, "text": msg}
-    requests.post(url, data=data)
+ULTIMA_SENAL = {}
 
-# -------- DATA --------
+# ===== TELEGRAM =====
+def enviar_telegram(msg):
+    if not TOKEN or not CHAT_ID:
+        print("⚠️ Telegram no configurado")
+        return
+
+    try:
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+    except Exception as e:
+        print("Error Telegram:", e)
+
+# ===== DATA =====
 def get_data(ticker):
-    df = yf.download(ticker, period="5d", interval="15m", progress=False)
+    try:
+        df = yf.download(ticker, interval="15m", period="3d", progress=False)
 
-    if df is None or df.empty:
+        if df is None or df.empty:
+            return None
+
+        df["EMA50"] = df["Close"].ewm(span=50).mean()
+        df["EMA200"] = df["Close"].ewm(span=200).mean()
+        df["VOL_MED"] = df["Volume"].rolling(20).mean()
+
+        return df.dropna()
+
+    except Exception as e:
+        print(f"Error datos {ticker}:", e)
         return None
 
-    # 🔥 SOLUCIÓN CLAVE → quitar multi-index
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+# ===== SEÑAL =====
+def generar_senal(df):
 
-    df = df.dropna()
-
-    return df
-
-# -------- MERCADO --------
-def market_direction():
-    df = get_data("SPY")
-    if df is None or len(df) < 200:
-        return "neutral"
-
-    df["EMA50"] = df["Close"].ewm(span=50).mean()
-    df["EMA200"] = df["Close"].ewm(span=200).mean()
-
-    ema50 = df["EMA50"].iloc[-1]
-    ema200 = df["EMA200"].iloc[-1]
-
-    if ema50 > ema200:
-        return "bull"
-    elif ema50 < ema200:
-        return "bear"
-    else:
-        return "neutral"
-
-# -------- FILTRO LATERAL --------
-def is_trending(df):
-    if len(df) < 20:
-        return False
-
-    high = df["High"].iloc[-20:].max()
-    low = df["Low"].iloc[-20:].min()
-
-    return (high - low) / low > 0.01
-
-# -------- SEÑALES --------
-def get_signal(df, ticker):
-    if df is None or len(df) < 50:
+    if df is None or len(df) < 210:
         return None
 
-    df["EMA50"] = df["Close"].ewm(span=50).mean()
-    df["EMA200"] = df["Close"].ewm(span=200).mean()
+    ultima = df.iloc[-1]
+    prev = df.iloc[-2]
 
-    ema50 = df["EMA50"].iloc[-1]
-    ema200 = df["EMA200"].iloc[-1]
-    close = df["Close"].iloc[-1]
+    # volumen
+    if not (float(ultima["Volume"]) > float(ultima["VOL_MED"])):
+        return None
 
-    breakout = df["High"].iloc[-10:-1].max()
-    breakdown = df["Low"].iloc[-10:-1].min()
+    # tendencia
+    alcista = float(ultima["EMA50"]) > float(ultima["EMA200"])
+    bajista = float(ultima["EMA50"]) < float(ultima["EMA200"])
 
-    # -------- COMPRA --------
-    if ema50 > ema200 and is_trending(df):
-        if close > breakout:
+    # pullback
+    pullback_long = float(prev["Close"]) < float(prev["EMA50"])
+    pullback_short = float(prev["Close"]) > float(prev["EMA50"])
 
-            entry = close
-            stop = df["Low"].iloc[-5:].min()
-            tp = entry + (entry - stop) * 2
+    # vela
+    vela_verde = float(ultima["Close"]) > float(ultima["Open"])
+    vela_roja = float(ultima["Close"]) < float(ultima["Open"])
 
-            risk = entry - stop
-            if risk <= 0:
-                return None
+    if alcista and pullback_long and vela_verde:
+        return "COMPRA"
 
-            size = RISK_EUR / risk
-
-            return f"""🟢 COMPRA {ticker}
-Entrada: {entry:.2f}
-Stop: {stop:.2f}
-TP: {tp:.2f}
-
-Riesgo: {risk:.2f}
-Tamaño: {size:.2f} €/punto"""
-
-    # -------- VENTA --------
-    if ema50 < ema200 and is_trending(df):
-        if close < breakdown:
-
-            entry = close
-            stop = df["High"].iloc[-5:].max()
-            tp = entry - (stop - entry) * 2
-
-            risk = stop - entry
-            if risk <= 0:
-                return None
-
-            size = RISK_EUR / risk
-
-            return f"""🔴 VENTA {ticker}
-Entrada: {entry:.2f}
-Stop: {stop:.2f}
-TP: {tp:.2f}
-
-Riesgo: {risk:.2f}
-Tamaño: {size:.2f} €/punto"""
+    if bajista and pullback_short and vela_roja:
+        return "VENTA"
 
     return None
 
-# -------- RUN --------
+# ===== TRADE =====
+def calcular_trade(df, tipo):
+
+    precio = float(df.iloc[-1]["Close"])
+
+    if tipo == "COMPRA":
+        sl = float(df["Low"].tail(5).min())
+        riesgo = precio - sl
+        tp = precio + (riesgo * 2)
+
+    else:
+        sl = float(df["High"].tail(5).max())
+        riesgo = sl - precio
+        tp = precio - (riesgo * 2)
+
+    if riesgo <= 0:
+        return None
+
+    tamaño = RIESGO_EUR / riesgo
+
+    return {
+        "entrada": precio,
+        "sl": sl,
+        "tp": tp,
+        "riesgo": riesgo,
+        "tamaño": tamaño
+    }
+
+# ===== RUN =====
 def run():
-    global last_message
+    print("\n--- Analizando mercado ---\n")
 
-    print("\nAnalizando mercado...\n")
+    for nombre, ticker in ACTIVOS.items():
 
-    hour = datetime.now(timezone.utc).hour
-    if hour < 13 or hour > 20:
-        print("⏰ Fuera horario USA")
-        return
+        df = get_data(ticker)
 
-    direction = market_direction()
-
-    mensajes = []
-
-    for t in tickers:
-        df = get_data(t)
         if df is None:
+            print(f"{nombre}: sin datos")
             continue
 
-        signal = get_signal(df, t)
+        señal = generar_senal(df)
 
-        if signal:
-            if "COMPRA" in signal and direction != "bull":
-                continue
-            if "VENTA" in signal and direction != "bear":
-                continue
+        if señal is None:
+            print(f"{nombre}: sin señal")
+            continue
 
-            print(signal)
-            mensajes.append(signal)
+        # anti spam
+        if ULTIMA_SENAL.get(nombre) == señal:
+            continue
 
-    if mensajes:
-        final = "🚨 SEÑALES PRO 🚨\n\n" + "\n\n".join(mensajes)
-        if final != last_message:
-            send_telegram(final)
-            last_message = final
-    else:
-        print("Sin oportunidades")
+        trade = calcular_trade(df, señal)
 
-# -------- LOOP --------
-while True:
-    run()
-    time.sleep(900)
+        if trade is None:
+            continue
+
+        mensaje = f"""
+{señal} {nombre}
+
+Entrada: {trade['entrada']:.2f}
+SL: {trade['sl']:.2f}
+TP: {trade['tp']:.2f}
+
+Riesgo: {trade['riesgo']:.2f}
+Tamaño: {trade['tamaño']:.2f}
+"""
+
+        print(mensaje)
+        enviar_telegram(mensaje)
+
+        ULTIMA_SENAL[nombre] = señal
+
+
+# ===== LOOP =====
+if __name__ == "__main__":
+
+    print("🚀 BOT INICIADO")
+
+    while True:
+        try:
+            run()
+        except Exception as e:
+            print("Error general:", e)
+
+        print("⏳ Esperando 5 minutos...\n")
+        time.sleep(300)
